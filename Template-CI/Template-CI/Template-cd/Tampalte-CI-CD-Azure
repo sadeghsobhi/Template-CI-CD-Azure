@@ -1,0 +1,131 @@
+# build-push-compose.yml
+
+parameters:
+  - name: pool
+    type: string
+    default: 'PublishDockerAgent'
+
+  - name: dockerfileDir
+    type: string           # exp: 'TMS.API'
+
+  - name: repositoryAddress
+    type: string           # exp: 'registry.buluttakin.com'
+
+  - name: containerRegistryService
+    type: string           # exp: 'BulutReg'
+
+  - name: sshEndpoint
+    type: string           # exp: '0244'
+
+  - name: project
+    type: string           # exp: 'TMS'
+
+  - name: service
+    type: string           # exp: 'api' | 'frontend' | 'billing' ...
+
+  - name: environment
+    type: string           # exp: 'demo'
+
+  - name: tag
+    type: string
+    default: '2.3.$(Build.BuildId)'
+
+stages:
+- stage: BuildAndPush
+  displayName: Build and Push
+  jobs:
+  - job: BuildAndPushBackend
+    displayName: BuildAndPushBackend
+    pool:
+      name: ${{ parameters.pool }}
+    variables:
+      Dockerfile: ${{ parameters.dockerfileDir }}
+      repositoryAddress: ${{ parameters.repositoryAddress }}
+
+      # Derive imageName = "<project>/<service>-<environment>"
+      # Kept lowercase to satisfy Docker/OCI name rules
+      imageName: ${{ format('{0}/{1}-{2}',
+                      lower(parameters.project),
+                      lower(parameters.service),
+                      lower(parameters.environment)) }}
+
+    steps:
+      - task: CopyFiles@2
+        inputs:
+          SourceFolder: $(Build.SourcesDirectory)/$(Dockerfile)
+          Contents: 'Dockerfile'
+          TargetFolder: $(Build.SourcesDirectory)/
+
+      - task: Bash@3
+        displayName: 'Prepare Dockerfile & NuGet.Config'
+        inputs:
+          targetType: 'inline'
+          script: |
+            #!/bin/bash
+            set -euo pipefail
+            # Create NuGet.Config
+            cat > NuGet.Config <<'EOF'
+            <?xml version="1.0" encoding="utf-8"?>
+            <configuration>
+              <packageSources>
+                <add key="BulutTakin NuGet" value="https://registry.buluttakin.com/repository/nuget-group/index.json" />
+              </packageSources>
+            </configuration>
+            EOF
+
+            # Inject NuGet.Config copy into Dockerfile
+            sed -i "s|WORKDIR /src|WORKDIR /src\nCOPY NuGet.Config /root/.nuget/NuGet/\n|g" Dockerfile
+
+            # Rewrite base image host
+            sed -i "s| mcr.microsoft.com| registry.buluttakin.com/mcr.microsoft.com|g" Dockerfile
+          workingDirectory: '$(Build.SourcesDirectory)/'
+
+      - task: Docker@2
+        displayName: 'Build and Push'
+        inputs:
+          command: buildAndPush
+          containerRegistry: ${{ parameters.containerRegistryService }}
+          repository: '$(imageName)'
+          dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+          tags: |
+            ${{ parameters.tag }}
+            latest
+
+      - task: DeleteFiles@1
+        displayName: 'Cleanup temp files'
+        inputs:
+          SourceFolder: '$(Build.SourcesDirectory)/'
+          Contents: |
+            Dockerfile
+            NuGet.Config
+
+      - task: SSH@0
+        displayName: 'Warm up node with latest image'
+        inputs:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          runOptions: 'commands'
+          commands: |
+            docker rmi -f $(repositoryAddress)/$(imageName):latest 2>/dev/null || true
+            docker pull $(repositoryAddress)/$(imageName):latest 2>/dev/null
+          readyTimeout: '20000'
+
+- stage: Deploy
+  displayName: Deploy Compose
+  dependsOn: BuildAndPush
+  jobs:
+  - job: Deploy
+    displayName: DockerComposeUp
+    pool:
+      name: ${{ parameters.pool }}
+    variables:
+      # Auto-built from project + environment (you can switch to docker-compose.yml if needed)
+      composeFileLocationOnProduction: '/var/projects/${{ parameters.project }}_Docker_DevOps/${{ parameters.environment }}_${{ lower(parameters.project) }}/compose.yml'
+    steps:
+      - task: SSH@0
+        inputs:
+          sshEndpoint: ${{ parameters.sshEndpoint }}
+          runOptions: 'commands'
+          commands: |
+            docker compose -f $(composeFileLocationOnProduction) down 2>/dev/null || true
+            docker compose -f $(composeFileLocationOnProduction) up -d 2>/dev/null
+          readyTimeout: '20000'
