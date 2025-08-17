@@ -1,0 +1,21 @@
+trigger: none
+
+resources:
+  repositories:
+    - repository: SharedTemplatesRepo
+      type: git
+      name: SharedTemplates/SharedTemplates   # ProjectName/RepoName
+      ref: main
+
+stages:
+- template: build-push-compose.yml@SharedTemplatesRepo
+  parameters:
+    pool: 'PublishDockerAgent'
+    tag: '2.3.$(Build.BuildId)'
+    project: 'TMS'
+    service: 'api'
+    dockerfileDir: 'TMS.API'
+    environment: 'demo'
+    containerRegistryService: 'BulutReg'
+    repositoryAddress: 'registry.buluttakin.com'
+    sshEndpoint: '0244'
